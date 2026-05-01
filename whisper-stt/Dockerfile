@@ -20,8 +20,9 @@ WORKDIR /app
 
 # Instalar dependencias Python (cacheado si requirements.txt no cambia)
 COPY requirements.txt .
-RUN pip install --no-cache-dir setuptools==69.5.1 wheel==0.43.0 && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip==24.0 && \
+    pip install --no-cache-dir setuptools==69.5.1 wheel==0.43.0 && \
+    pip install --no-cache-dir --no-build-isolation -r requirements.txt
 
 # Copiar código fuente
 COPY app.py .
