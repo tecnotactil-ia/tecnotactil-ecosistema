@@ -1,0 +1,18 @@
+# Credenciales — NUNCA subir al repositorio
+.env
+.env.backup
+*.env.local
+
+# Datos de volúmenes locales
+data/
+volumes/
+
+# Logs
+*.log
+logs/
+
+# Temporales
+*.tmp
+__pycache__/
+*.pyc
+.DS_Store

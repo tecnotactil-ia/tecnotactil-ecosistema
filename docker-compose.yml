@@ -1,0 +1,288 @@
+# =============================================================================
+# Tecno Táctil - Ecosistema Principal
+# Servicios: n8n, Evolution API, PostgreSQL, Redis, Whisper STT, Nginx
+# Dominio n8n:       bak.tecnotactil.com
+# Dominio Evolution: evolution.tecnotactil.com
+# =============================================================================
+
+version: "3.9"
+
+networks:
+  # Red interna compartida por todos los servicios
+  tecnotactil_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+volumes:
+  postgres_data:
+  redis_data:
+  n8n_data:
+  evolution_data:
+  whisper_models:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — Base de datos compartida (n8n + Evolution API)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: tt_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Script de init crea las 2 bases de datos automáticamente
+      POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_DB_N8N},${POSTGRES_DB_EVOLUTION}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    networks:
+      - tecnotactil_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis — Caché compartido (n8n + Evolution API)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: tt_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - tecnotactil_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # n8n — Motor de automatización
+  # URL: https://bak.tecnotactil.com
+  # ---------------------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: tt_n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Entorno general
+      N8N_HOST: bak.tecnotactil.com
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://bak.tecnotactil.com/
+      N8N_EDITOR_BASE_URL: https://bak.tecnotactil.com/
+
+      # Base de datos PostgreSQL
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB_N8N}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # Redis para cola de trabajos (modo queue)
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      EXECUTIONS_MODE: queue
+
+      # Seguridad
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_BASIC_AUTH_ACTIVE: "false"
+
+      # Timezone
+      GENERIC_TIMEZONE: Europe/Rome
+      TZ: Europe/Rome
+
+      # Logs
+      N8N_LOG_LEVEL: info
+      N8N_LOG_OUTPUT: console
+
+      # Rutas internas
+      N8N_USER_FOLDER: /home/node/.n8n
+
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - tecnotactil_net
+    expose:
+      - "5678"
+
+  # ---------------------------------------------------------------------------
+  # Evolution API — Gateway WhatsApp
+  # URL: https://evolution.tecnotactil.com
+  # ---------------------------------------------------------------------------
+  evolution:
+    image: atendai/evolution-api:latest
+    container_name: tt_evolution
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Servidor
+      SERVER_URL: https://evolution.tecnotactil.com
+      DEL_INSTANCE: "false"
+
+      # Base de datos PostgreSQL
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB_EVOLUTION}
+      DATABASE_CONNECTION_CLIENT_NAME: evolution_api
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      DATABASE_SAVE_DATA_LABELS: "true"
+      DATABASE_SAVE_DATA_HISTORIC: "true"
+
+      # Redis
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_SAVE_INSTANCES: "false"
+      CACHE_LOCAL_ENABLED: "false"
+
+      # Seguridad
+      AUTHENTICATION_TYPE: apikey
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+
+      # Webhook global (opcional)
+      WEBHOOK_GLOBAL_ENABLED: "false"
+
+      # QR Code
+      QRCODE_LIMIT: 30
+      QRCODE_COLOR: "#175197"
+
+      # Logs
+      LOG_LEVEL: ERROR
+      LOG_COLOR: "true"
+
+      # Timezone
+      TZ: Europe/Rome
+
+    volumes:
+      - evolution_data:/evolution/instances
+    networks:
+      - tecnotactil_net
+    expose:
+      - "8080"
+
+  # ---------------------------------------------------------------------------
+  # Whisper STT API — Servidor HTTP Flask (recibe requests, encola jobs)
+  # Interno: http://tt_whisper:9000
+  # ---------------------------------------------------------------------------
+  whisper:
+    build:
+      context: ./whisper-stt
+      dockerfile: Dockerfile
+    container_name: tt_whisper
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: python app.py
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-es}
+      WHISPER_API_KEY: ${WHISPER_API_KEY}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB_QUEUE: 2
+      MAX_QUEUE_SIZE: 50
+      MAX_FILE_SIZE_MB: 50
+      TZ: Europe/Rome
+    volumes:
+      - whisper_models:/root/.cache/whisper
+    networks:
+      - tecnotactil_net
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Whisper Worker — Proceso RQ que ejecuta las transcripciones en background
+  # Misma imagen que tt_whisper, distinto CMD.
+  # Carga el modelo large-v3 en RAM (~10GB) al iniciar.
+  # ---------------------------------------------------------------------------
+  whisper_worker:
+    build:
+      context: ./whisper-stt
+      dockerfile: Dockerfile
+    container_name: tt_whisper_worker
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      rq worker
+      --url redis://:${REDIS_PASSWORD}@redis:6379/2
+      --name whisper-worker-1
+      --max-jobs 0
+      whisper
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-es}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB_QUEUE: 2
+      TZ: Europe/Rome
+    volumes:
+      - whisper_models:/root/.cache/whisper
+    networks:
+      - tecnotactil_net
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+
+  # ---------------------------------------------------------------------------
+  # Nginx — Proxy inverso con SSL (Certbot gestionado externamente)
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: tt_nginx
+    restart: unless-stopped
+    depends_on:
+      - n8n
+      - evolution
+      - whisper
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
+    networks:
+      - tecnotactil_net
