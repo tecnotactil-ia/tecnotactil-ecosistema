@@ -5,8 +5,6 @@
 # Dominio Evolution: evolution.tecnotactil.com
 # =============================================================================
 
-version: "3.9"
-
 networks:
   # Red interna compartida por todos los servicios
   tecnotactil_net:
